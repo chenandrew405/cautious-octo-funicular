@@ -37,10 +37,13 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from openai import OpenAI
+    import requests
 except ImportError:
-    print("Missing 'openai' package. Install with: pip3 install openai")
+    print("Missing 'requests' package. Install with: pip3 install requests")
     sys.exit(1)
+
+# Ollama API endpoint
+OLLAMA_BASE_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
@@ -283,20 +286,65 @@ def build_style_profile(analysis):
 # ─────────────────────────────────────────────────────────────────────────────
 
 
-def get_openai_client():
-    """Initialize OpenAI client."""
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        console.print("[red]Error:[/red] OPENAI_API_KEY environment variable not set.")
-        console.print("\nSet it with:")
-        console.print("  export OPENAI_API_KEY='your-key-here'")
+def check_ollama_connection():
+    """Verify Ollama is running and return available models."""
+    try:
+        resp = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=5)
+        if resp.status_code == 200:
+            models = resp.json().get("models", [])
+            return [m["name"] for m in models]
+        else:
+            return None
+    except requests.ConnectionError:
+        console.print("[red]Error:[/red] Cannot connect to Ollama.")
+        console.print(f"\nMake sure Ollama is running at: {OLLAMA_BASE_URL}")
+        console.print("  Start it with: [bold]ollama serve[/bold]")
+        console.print("  Install from:  https://ollama.com")
         sys.exit(1)
-    return OpenAI(api_key=api_key)
+    except Exception as e:
+        console.print(f"[red]Error connecting to Ollama:[/red] {e}")
+        sys.exit(1)
 
 
-def generate_reply(client, conversation_context, style_analysis, tone="neutral", custom_prompt=None):
+def select_ollama_model(models):
+    """Let user pick an Ollama model from available ones."""
+    if not models:
+        console.print("[red]No models found.[/red] Pull one with:")
+        console.print("  ollama pull llama3.1")
+        console.print("  ollama pull mistral")
+        sys.exit(1)
+
+    table = Table(
+        title="Available Ollama Models",
+        box=box.ROUNDED,
+        border_style="green",
+    )
+    table.add_column("#", style="bold yellow", width=4)
+    table.add_column("Model", style="bold white")
+
+    for i, model in enumerate(models, 1):
+        table.add_row(str(i), model)
+
+    console.print(table)
+    console.print()
+
+    while True:
+        choice = Prompt.ask(
+            "[bold yellow]Select model #[/bold yellow]",
+            default="1"
+        )
+        try:
+            idx = int(choice) - 1
+            if 0 <= idx < len(models):
+                return models[idx]
+            console.print("[red]Invalid selection.[/red]")
+        except ValueError:
+            console.print("[red]Enter a number.[/red]")
+
+
+def generate_reply(model, conversation_context, style_analysis, tone="neutral", custom_prompt=None):
     """
-    Generate a reply using the LLM that imitates the other person's style.
+    Generate a reply using Ollama that imitates the other person's style.
 
     Uses Text Style Transfer (TST) approach:
     1. Analyze source style attributes
@@ -352,16 +400,33 @@ Generate a reply as "ME" to the last message from "THEM".
 Match the style perfectly. Only output the message text."""
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.9,
-            max_tokens=200,
+        resp = requests.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "stream": False,
+                "options": {
+                    "temperature": 0.9,
+                    "num_predict": 200,
+                },
+            },
+            timeout=60,
         )
-        return response.choices[0].message.content.strip().strip('"').strip("'")
+        if resp.status_code == 200:
+            content = resp.json().get("message", {}).get("content", "").strip()
+            # Clean up any quotes the model might wrap around the response
+            content = content.strip('"').strip("'")
+            return content
+        else:
+            console.print(f"[red]Ollama Error ({resp.status_code}):[/red] {resp.text[:200]}")
+            return None
+    except requests.Timeout:
+        console.print("[red]Ollama request timed out.[/red] The model may be too large.")
+        return None
     except Exception as e:
         console.print(f"[red]LLM Error:[/red] {e}")
         return None
@@ -542,10 +607,14 @@ def main():
     conn = get_db_connection()
     console.print("[green]Connected.[/green]\n")
 
-    # Initialize OpenAI
-    console.print("[dim]Initializing LLM...[/dim]")
-    client = get_openai_client()
-    console.print("[green]LLM ready.[/green]\n")
+    # Initialize Ollama
+    console.print("[dim]Connecting to Ollama...[/dim]")
+    models = check_ollama_connection()
+    console.print(f"[green]Ollama connected.[/green] ({len(models)} model{'s' if len(models) != 1 else ''} available)\n")
+
+    # Select model
+    model = select_ollama_model(models)
+    console.print(f"\n[bold]Using model:[/bold] {model}\n")
 
     # Fetch conversations
     conversations = get_conversations(conn)
@@ -636,7 +705,7 @@ def main():
 
             console.print(f"\n[dim]Generating {tone_label} reply...[/dim]")
 
-            reply = generate_reply(client, messages, analysis, tone=tone)
+            reply = generate_reply(model, messages, analysis, tone=tone)
             if reply:
                 current_reply = reply
                 current_tone = tone_label
@@ -672,7 +741,7 @@ def main():
                     console.print("[dim]Regenerating with your guidance...[/dim]")
 
                     reply = generate_reply(
-                        client, messages, analysis,
+                        model, messages, analysis,
                         tone=tone,
                         custom_prompt=custom_prompt
                     )
@@ -707,7 +776,7 @@ def main():
         elif action == "r":
             if current_tone:
                 console.print("[dim]Regenerating...[/dim]")
-                reply = generate_reply(client, messages, analysis, tone=current_tone)
+                reply = generate_reply(model, messages, analysis, tone=current_tone)
                 if reply:
                     current_reply = reply
                     display_generated_reply(reply, current_tone)
@@ -735,7 +804,7 @@ def main():
                         )
                         console.print("[dim]Regenerating with guidance...[/dim]")
                         reply = generate_reply(
-                            client, messages, analysis,
+                            model, messages, analysis,
                             tone=current_tone,
                             custom_prompt=custom_prompt
                         )
